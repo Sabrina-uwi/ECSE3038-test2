@@ -1,173 +1,386 @@
+
 import os
 import secrets
-import json
 from datetime import datetime, timezone
+from typing import Literal
 
-from fastapi import FastAPI, Header, HTTPException, Response
+import paho.mqtt.client as mqtt
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pymongo import MongoClient, DESCENDING
-from dotenv import load_dotenv
-import paho.mqtt.publish as mqtt_publish
+from pymongo.errors import DuplicateKeyError
+
+
+# --------------------------------------------------
+# ENVIRONMENT VARIABLES
+# --------------------------------------------------
 
 load_dotenv()
 
 MONGODB_URI = os.getenv("MONGODB_URI")
-MQTT_NAME = os.getenv("MQTT_NAME")
+MQTT_NAME = os.getenv("MQTT_NAME", "probiotic")
 
-BROKER_HOST = "135.232.203.144"
-BROKER_PORT = 1883
+if not MONGODB_URI:
+    raise RuntimeError("MONGODB_URI is missing from .env")
 
-client = MongoClient(MONGODB_URI)
-db = client.ecse3038
-fans = db.fans
-readings = db.readings
+MQTT_BROKER = "135.232.203.144"
+MQTT_PORT = 1883
 
-app = FastAPI()
-
-
-# ---------- Models ----------
-class FanIn(BaseModel):
-    mac: str
-    room: str
+if not MQTT_NAME.isalnum() or MQTT_NAME.lower() != MQTT_NAME:
+    raise RuntimeError("MQTT_NAME must contain lowercase letters and digits only")
 
 
-class ReadingIn(BaseModel):
-    mac: str
-    humidity: float
+# --------------------------------------------------
+# DATABASE CONNECTION
+# --------------------------------------------------
+
+mongo_client = MongoClient(
+    MONGODB_URI,
+    serverSelectionTimeoutMS=5000
+)
+
+db = mongo_client["ECSE3038test2"]
+
+fans_collection = db["fans"]
+readings_collection = db["readings"]
+
+# MAC addresses must be unique.
+fans_collection.create_index("mac", unique=True)
 
 
-class SettingsIn(BaseModel):
-    mode: str
-    max_humidity: float
+# --------------------------------------------------
+# FASTAPI APPLICATION
+# --------------------------------------------------
+
+app = FastAPI(title="ECSE3038 Bathroom Fan API")
 
 
-# ---------- Helpers ----------
-def strip_key(doc):
-    doc = dict(doc)
-    doc.pop("_id", None)
-    doc.pop("key", None)
-    return doc
+# --------------------------------------------------
+# PYDANTIC MODELS
+# --------------------------------------------------
+
+class FanCreate(BaseModel):
+    mac: str = Field(min_length=1)
+    room: str = Field(min_length=1)
 
 
-def publish_settings(mode: str, max_humidity: float):
+class ReadingCreate(BaseModel):
+    mac: str = Field(min_length=1)
+    humidity: float = Field(ge=0, le=100)
+
+
+class FanSettings(BaseModel):
+    mode: Literal["auto", "on", "off"]
+    max_humidity: float = Field(ge=0, le=100)
+
+
+# --------------------------------------------------
+# HELPER FUNCTIONS
+# --------------------------------------------------
+
+def normalize_mac(mac: str) -> str:
+    return mac.strip().lower()
+
+
+def public_fan(fan):
+    """Remove private API key and MongoDB ID."""
+    fan = dict(fan)
+    fan.pop("_id", None)
+    fan.pop("api_key", None)
+    return fan
+
+
+def authenticate_fan(mac: str, api_key: str | None):
+    """
+    Check whether an API key exists and belongs
+    to the requested fan.
+    """
+
+    if not api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key"
+        )
+
+    fan = fans_collection.find_one({
+        "api_key": api_key
+    })
+
+    if fan is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key"
+        )
+
+    if fan["mac"] != normalize_mac(mac):
+        raise HTTPException(
+            status_code=403,
+            detail="API key belongs to another fan"
+        )
+
+    return fan
+
+
+def publish_settings(mac: str, settings: dict):
+    """Publish retained fan settings using MQTT."""
+
     topic = f"ecse3038/{MQTT_NAME}/fan/settings"
-    payload = json.dumps({"mode": mode, "max_humidity": float(max_humidity)})
-    mqtt_publish.single(
-        topic,
-        payload=payload,
-        qos=1,
-        retain=True,
-        hostname=BROKER_HOST,
-        port=BROKER_PORT,
+
+    client = mqtt.Client(
+        mqtt.CallbackAPIVersion.VERSION1
     )
 
+    try:
+        client.connect(
+            MQTT_BROKER,
+            MQTT_PORT,
+            60
+        )
 
-# ---------- A1: Fan registry ----------
+        client.loop_start()
+
+        info = client.publish(
+            topic,
+            payload=__import__("json").dumps(settings),
+            qos=1,
+            retain=True
+        )
+
+        info.wait_for_publish(timeout=5)
+
+        if not info.is_published():
+            raise RuntimeError("MQTT publish timed out")
+
+        client.loop_stop()
+        client.disconnect()
+
+    except Exception as error:
+        try:
+            client.loop_stop()
+            client.disconnect()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=503,
+            detail=f"MQTT publishing failed: {str(error)}"
+        )
+
+
+# --------------------------------------------------
+# A1: REGISTER AND RETRIEVE FANS
+# --------------------------------------------------
+
 @app.post("/fans", status_code=201)
-def create_fan(body: FanIn):
-    if fans.find_one({"mac": body.mac}):
-        raise HTTPException(status_code=409, detail="MAC already exists")
-    key = secrets.token_urlsafe(16)
-    fans.insert_one({"mac": body.mac, "room": body.room, "key": key})
-    return {"mac": body.mac, "room": body.room, "key": key}
+def create_fan(fan: FanCreate):
+
+    mac = normalize_mac(fan.mac)
+
+    api_key = secrets.token_urlsafe(16)
+
+    new_fan = {
+        "mac": mac,
+        "room": fan.room,
+        "api_key": api_key
+    }
+
+    try:
+        fans_collection.insert_one(new_fan)
+
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="Fan already exists"
+        )
+
+    return {
+        "mac": mac,
+        "room": fan.room,
+        "api_key": api_key
+    }
 
 
 @app.get("/fans")
-def list_fans():
-    return [strip_key(f) for f in fans.find()]
+def get_fans():
+
+    fans = fans_collection.find(
+        {},
+        {"api_key": 0}
+    )
+
+    return [
+        public_fan(fan)
+        for fan in fans
+    ]
 
 
 @app.get("/fans/{mac}")
 def get_fan(mac: str):
-    fan = fans.find_one({"mac": mac})
-    if not fan:
-        raise HTTPException(status_code=404, detail="Fan not found")
-    return strip_key(fan)
+
+    fan = fans_collection.find_one({
+        "mac": normalize_mac(mac)
+    })
+
+    if fan is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Fan not found"
+        )
+
+    return public_fan(fan)
 
 
-# ---------- A2: POST /readings ----------
+# --------------------------------------------------
+# A2: RECEIVE HUMIDITY READINGS
+# --------------------------------------------------
+
 @app.post("/readings", status_code=201)
-def add_reading(body: ReadingIn, x_api_key: str = Header(default=None)):
-    if x_api_key is None:
-        raise HTTPException(status_code=401, detail="Missing key")
+def create_reading(
+    reading: ReadingCreate,
+    api_key: str | None = Header(
+        default=None,
+        alias="X-API-Key"
+    )
+):
 
-    fan = fans.find_one({"key": x_api_key})
-    if not fan:
-        raise HTTPException(status_code=401, detail="Unknown key")
-    if fan["mac"] != body.mac:
-        raise HTTPException(status_code=403, detail="Key belongs to another MAC")
+    mac = normalize_mac(reading.mac)
 
-    if body.humidity < 0 or body.humidity > 100:
-        raise HTTPException(status_code=422, detail="Humidity out of range")
+    authenticate_fan(mac, api_key)
 
-    doc = {
-        "mac": body.mac,
-        "humidity": body.humidity,
-        "time": datetime.now(timezone.utc).isoformat(),
+    new_reading = {
+        "mac": mac,
+        "humidity": reading.humidity,
+        "timestamp": datetime.now(timezone.utc)
     }
-    readings.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+
+    readings_collection.insert_one(new_reading)
+
+    return {
+        "message": "Reading saved",
+        "mac": mac,
+        "humidity": reading.humidity,
+        "timestamp": new_reading["timestamp"]
+    }
 
 
-# ---------- A3: GET /readings ----------
+# --------------------------------------------------
+# A3: RETRIEVE READINGS
+# --------------------------------------------------
+
 @app.get("/readings")
-def get_readings(mac: str | None = None, limit: int = 10):
-    if limit < 1 or limit > 100:
-        raise HTTPException(status_code=422, detail="limit must be 1..100")
+def get_readings(
+    mac: str | None = None,
+    limit: int = Query(
+        default=10,
+        ge=1,
+        le=100
+    )
+):
 
     query = {}
-    if mac is not None:
-        query["mac"] = mac
 
-    cursor = readings.find(query).sort("time", DESCENDING).limit(limit)
-    out = []
-    for r in cursor:
-        r.pop("_id", None)
-        out.append(r)
-    return out
+    if mac:
+        query["mac"] = normalize_mac(mac)
+
+    readings = readings_collection.find(
+        query
+    ).sort(
+        "timestamp",
+        DESCENDING
+    ).limit(limit)
+
+    results = []
+
+    for reading in readings:
+        reading["_id"] = str(reading["_id"])
+        results.append(reading)
+
+    return results
 
 
-# ---------- A4: PUT /fans/{mac}/settings ----------
+# --------------------------------------------------
+# A4: UPDATE FAN SETTINGS
+# --------------------------------------------------
+
 @app.put("/fans/{mac}/settings")
-def put_settings(mac: str, body: SettingsIn, response: Response):
-    if body.mode not in ("auto", "on", "off"):
-        raise HTTPException(status_code=422, detail="mode must be auto/on/off")
-    if body.max_humidity < 0 or body.max_humidity > 100:
-        raise HTTPException(status_code=422, detail="max_humidity 0..100")
+def update_fan_settings(
+    mac: str,
+    settings: FanSettings
+):
 
-    fan = fans.find_one({"mac": mac})
-    if not fan:
-        raise HTTPException(status_code=404, detail="Fan not found")
+    mac = normalize_mac(mac)
 
-    existing = fans.find_one({"mac": mac, "settings": {"$exists": True}})
-    status = 200 if existing else 201
+    fan = fans_collection.find_one({
+        "mac": mac
+    })
 
-    fans.update_one(
-        {"mac": mac},
-        {"$set": {"settings": {"mode": body.mode, "max_humidity": body.max_humidity}}},
+    if fan is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Fan not found"
+        )
+
+    is_new = not (
+        "mode" in fan and
+        "max_humidity" in fan
     )
-    publish_settings(body.mode, body.max_humidity)
-    response.status_code = status
-    return {"mode": body.mode, "max_humidity": body.max_humidity}
+
+    settings_data = {
+        "mode": settings.mode,
+        "max_humidity": settings.max_humidity
+    }
+
+    fans_collection.update_one(
+        {"mac": mac},
+        {"$set": settings_data}
+    )
+
+    # Publish the new settings to the board.
+    publish_settings(mac, settings_data)
+
+    status_code = 201 if is_new else 200
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "mac": mac,
+            "mode": settings.mode,
+            "max_humidity": settings.max_humidity
+        }
+    )
 
 
-# ---------- A5: DELETE /fans/{mac} ----------
+# --------------------------------------------------
+# A5: DELETE FAN
+# --------------------------------------------------
+
 @app.delete("/fans/{mac}", status_code=204)
-def delete_fan(mac: str, x_api_key: str = Header(default=None)):
-    fan = fans.find_one({"mac": mac})
-    if not fan:
-        raise HTTPException(status_code=404, detail="Fan not found")
+def delete_fan(
+    mac: str,
+    api_key: str | None = Header(
+        default=None,
+        alias="X-API-Key"
+    )
+):
 
-    if x_api_key is None:
-        raise HTTPException(status_code=401, detail="Missing key")
-    if x_api_key != fan["key"]:
-        # Distinguish: does this key belong to ANY fan?
-        other = fans.find_one({"key": x_api_key})
-        if other is None:
-            raise HTTPException(status_code=401, detail="Unknown key")
-        raise HTTPException(status_code=403, detail="Key belongs to another fan")
+    mac = normalize_mac(mac)
 
-    fans.delete_one({"mac": mac})
-    return Response(status_code=204)
+    fan = fans_collection.find_one({
+        "mac": mac
+    })
+
+    if fan is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Fan not found"
+        )
+
+    authenticate_fan(mac, api_key)
+
+    fans_collection.delete_one({
+        "mac": mac
+    })
+
+    return None
